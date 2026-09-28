@@ -1220,3 +1220,119 @@ def test_illuminance_reconciliation_read_only_and_tz_normalized(client):
 
     # 只读：已存区间不变
     assert client.get(f"/api/v1/showcases/{case_id}/intervals").json() == before_intervals
+
+
+# ------------------------------------------------------------- 照明区间精简
+
+def _post_simplification(client, case_id):
+    return client.post(f"/api/v1/showcases/{case_id}/lighting-simplification")
+
+
+def test_lighting_simplification_removes_redundant_dark_interval(client):
+    """亮区间完全覆盖暗区间：暗区间（更高 ID）可撤；等照度覆盖链按降序贪心撤去。"""
+    case_id = _create_case(client, name="精简柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 300},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 50},
+        ]},
+    )
+    ids = [iv["id"] for iv in r.json()]
+
+    r = _post_simplification(client, case_id)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["showcase_id"] == case_id
+    assert body["showcase_name"] == "精简柜"
+    assert body["interval_count"] == 2
+    assert body["removable_interval_ids"] == [ids[1]]
+    assert body["retained_interval_ids"] == [ids[0]]
+    assert body["original_segments"] == body["simplified_segments"]
+    assert body["original_segments"] == [
+        {"start": "2026-03-01T08:00:00+00:00", "end": "2026-03-01T18:00:00+00:00", "lux": 300.0}
+    ]
+
+
+def test_lighting_simplification_equal_lux_ties_and_required_both(client):
+    """等照度并列：覆盖链可撤多余项；互补并列则两条都须保留。"""
+    case_id = _create_case(client, name="精简并列柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 50},
+            {"start": "2026-03-01T09:00:00Z", "end": "2026-03-01T11:00:00Z", "lux": 50},
+        ]},
+    )
+    ids = [iv["id"] for iv in r.json()]
+    body = _post_simplification(client, case_id).json()
+    assert body["removable_interval_ids"] == [ids[1], ids[2]]
+    assert body["retained_interval_ids"] == [ids[0]]
+
+    # 互补并列（任一条撤去都会留下缺口）：都须保留
+    case2 = _create_case(client, name="精简互补柜")
+    r = client.post(
+        f"/api/v1/showcases/{case2}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 50},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T14:00:00Z", "lux": 50},
+        ]},
+    )
+    ids2 = [iv["id"] for iv in r.json()]
+    body = _post_simplification(client, case2).json()
+    assert body["removable_interval_ids"] == []
+    assert body["retained_interval_ids"] == ids2
+
+
+def test_lighting_simplification_zero_lux_and_cross_year(client):
+    """0 lux 区间恒可撤（独立 / 重叠皆然）；跨年区间整体参与合并。"""
+    case_id = _create_case(client, name="精简跨年柜")
+    r = client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2025-12-31T20:00:00Z", "end": "2026-01-01T04:00:00Z", "lux": 100},
+            {"start": "2025-12-31T22:00:00Z", "end": "2026-01-01T02:00:00Z", "lux": 50},
+            {"start": "2026-01-02T00:00:00Z", "end": "2026-01-02T01:00:00Z", "lux": 0},
+        ]},
+    )
+    ids = [iv["id"] for iv in r.json()]
+    body = _post_simplification(client, case_id).json()
+    assert body["removable_interval_ids"] == [ids[1], ids[2]]
+    assert body["retained_interval_ids"] == [ids[0]]
+    assert body["simplified_segments"] == [
+        {
+            "start": "2025-12-31T20:00:00+00:00",
+            "end": "2026-01-01T04:00:00+00:00",
+            "lux": 100.0,
+        }
+    ]
+
+
+def test_lighting_simplification_empty_and_unknown_showcase(client):
+    """无区间时返回空列表；未知展柜 404。"""
+    case_id = _create_case(client, name="精简空柜")
+    body = _post_simplification(client, case_id).json()
+    assert body["interval_count"] == 0
+    assert body["removable_interval_ids"] == []
+    assert body["retained_interval_ids"] == []
+    assert body["original_segments"] == []
+    assert body["simplified_segments"] == []
+
+    assert _post_simplification(client, 4242).status_code == 404
+
+
+def test_lighting_simplification_read_only(client):
+    """精简建议全程只读：已存照明区间不变。"""
+    case_id = _create_case(client, name="精简只读柜")
+    client.post(
+        f"/api/v1/showcases/{case_id}/intervals",
+        json={"intervals": [
+            {"start": "2026-03-01T08:00:00Z", "end": "2026-03-01T18:00:00Z", "lux": 50},
+            {"start": "2026-03-01T10:00:00Z", "end": "2026-03-01T12:00:00Z", "lux": 50},
+        ]},
+    )
+    before = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+    assert _post_simplification(client, case_id).status_code == 200
+    after = client.get(f"/api/v1/showcases/{case_id}/intervals").json()
+    assert after == before

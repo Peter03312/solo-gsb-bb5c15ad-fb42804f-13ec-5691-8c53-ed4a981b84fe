@@ -16,6 +16,7 @@ from app.timeline import (
     integrate_within,
     merge_intervals,
     reconcile_illuminance,
+    simplify_intervals,
     year_bounds,
 )
 
@@ -275,3 +276,128 @@ def test_reconcile_clips_plan_segments_to_window():
     assert result.negative_lux_hours == 10.0
     assert result.over_tolerance_hours == 3.0
     assert result.anomalies == (DeviationAnomaly(_dt(9), _dt(12), DEVIATION_OVER, 3.0),)
+
+
+# ------------------------------------------------------------- 照明区间精简
+
+def test_simplify_empty():
+    result = simplify_intervals([])
+    assert result.removable_ids == ()
+    assert result.retained_ids == ()
+    assert result.original_segments == ()
+    assert result.simplified_segments == ()
+
+
+def test_simplify_dominated_bright_interval_removed():
+    # 区间 1: 08-18 @50；区间 2: 10-12 @300（更高 ID，先尝试）。
+    # 撤 2 后 10-12 从 300 降为 50 → 时间线改变，2 须保留；
+    # 撤 1 后 08-10、12-18 变暗，仅 10-12 仍有 300 → 时间线改变，1 也须保留。
+    result = simplify_intervals(
+        [(1, _dt(8), _dt(18), 50), (2, _dt(10), _dt(12), 300)]
+    )
+    assert result.removable_ids == ()
+    assert result.retained_ids == (1, 2)
+
+
+def test_simplify_interval_fully_covered_by_brighter_one():
+    # 区间 1: 08-18 @300；区间 2: 10-12 @50（暗区间完全被亮区间覆盖）。
+    # 按 ID 降序先试 2：撤去后时间线不变 → 可撤；只剩 1。
+    result = simplify_intervals(
+        [(1, _dt(8), _dt(18), 300), (2, _dt(10), _dt(12), 50)]
+    )
+    assert result.removable_ids == (2,)
+    assert result.retained_ids == (1,)
+    assert result.simplified_segments == (Segment(_dt(8), _dt(18), 300),)
+
+
+def test_simplify_equal_lux_ties():
+    # 三条等照度 50：1: 08-18、2: 10-12、3: 09-11。
+    # 先试 3：09-10 由 1 覆盖、10-11 由 1、2 覆盖 → 不变，撤去；
+    # 再试 2：10-12 仍由 1 全程覆盖 → 不变，撤去；1 不可撤。
+    result = simplify_intervals(
+        [
+            (1, _dt(8), _dt(18), 50),
+            (2, _dt(10), _dt(12), 50),
+            (3, _dt(9), _dt(11), 50),
+        ]
+    )
+    assert result.removable_ids == (2, 3)
+    assert result.retained_ids == (1,)
+    assert result.simplified_segments == (Segment(_dt(8), _dt(18), 50),)
+    assert result.original_segments == (Segment(_dt(8), _dt(18), 50),)
+
+
+def test_simplify_tied_overlap_both_required_after_first_removal():
+    # 等照度并列但任一条都覆盖不到对方全部时段：
+    # 1: 08-12 @50、2: 10-14 @50。单看任一条撤去都会留下缺口 → 都须保留
+    # （即便两条并集时间线合并后只是 08-14 一段 50）。
+    result = simplify_intervals(
+        [(1, _dt(8), _dt(12), 50), (2, _dt(10), _dt(14), 50)]
+    )
+    assert result.removable_ids == ()
+    assert result.retained_ids == (1, 2)
+    assert result.original_segments == (Segment(_dt(8), _dt(14), 50),)
+
+
+def test_simplify_zero_lux_intervals_always_removable():
+    # 0 lux 区间不产生有效照度：独立的与重叠的都可撤去
+    result = simplify_intervals(
+        [
+            (1, _dt(8), _dt(12), 50),
+            (2, _dt(13), _dt(14), 0),
+            (3, _dt(9), _dt(10), 0),
+        ]
+    )
+    assert result.removable_ids == (2, 3)
+    assert result.retained_ids == (1,)
+    assert result.simplified_segments == (Segment(_dt(8), _dt(12), 50),)
+
+
+def test_simplify_descending_id_greedy_order_matters():
+    # 两条完全相同的 50 lux 区间（等照度并列，整条冗余一条）：
+    # 按 ID 降序先撤 2 → 1 保留；结果可撤 [2]。
+    result = simplify_intervals(
+        [(1, _dt(8), _dt(12), 50), (2, _dt(8), _dt(12), 50)]
+    )
+    assert result.removable_ids == (2,)
+    assert result.retained_ids == (1,)
+
+
+def test_simplify_pointwise_equality_not_integral():
+    # 曝光积分相同但逐时刻照度不同，不得判为可撤：
+    # 1: 08-10 @100（200 lux·h）；2: 08-12 @50（200 lux·h，时长翻倍）。
+    # 撤 1 后 08-10 变成 50、10-12 新增 50 → 时间线改变；撤 2 同理改变。
+    result = simplify_intervals(
+        [(1, _dt(8), _dt(10), 100), (2, _dt(8), _dt(12), 50)]
+    )
+    assert result.removable_ids == ()
+    assert result.retained_ids == (1, 2)
+
+
+def test_simplify_cross_day_and_cross_year_handled():
+    # 跨年区间 2025-12-31 20:00 → 2026-01-01 04:00 @100（区间 1）
+    # 被区间 2：2025-12-31 22:00 → 2026-01-01 02:00 @50 部分重叠，
+    # 暗区间完全落在亮区间内 → 可撤；跨年边界不影响判定。
+    long_start = datetime(2025, 12, 31, 20, tzinfo=timezone.utc)
+    long_end = datetime(2026, 1, 1, 4, tzinfo=timezone.utc)
+    short_start = datetime(2025, 12, 31, 22, tzinfo=timezone.utc)
+    short_end = datetime(2026, 1, 1, 2, tzinfo=timezone.utc)
+    result = simplify_intervals(
+        [(1, long_start, long_end, 100), (2, short_start, short_end, 50)]
+    )
+    assert result.removable_ids == (2,)
+    assert result.retained_ids == (1,)
+    assert result.simplified_segments == (Segment(long_start, long_end, 100),)
+
+
+def test_simplify_original_and_simplified_segments_identical():
+    result = simplify_intervals(
+        [
+            (1, _dt(8), _dt(18), 50),
+            (2, _dt(10), _dt(12), 50),   # 被 1 完全覆盖
+            (3, _dt(20), _dt(22), 80),   # 独立保留
+        ]
+    )
+    assert result.removable_ids == (2,)
+    assert result.retained_ids == (1, 3)
+    assert result.original_segments == result.simplified_segments

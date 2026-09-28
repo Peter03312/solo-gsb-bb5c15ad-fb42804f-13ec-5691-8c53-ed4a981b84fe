@@ -206,6 +206,70 @@ def attribute_exposure(
     ]
 
 
+@dataclass(frozen=True)
+class SimplificationResult:
+    """照明区间精简结果：可撤去 / 须保留的区间 ID 与两条恒照度时间线。"""
+
+    removable_ids: tuple[int, ...]
+    retained_ids: tuple[int, ...]
+    original_segments: tuple[Segment, ...]
+    simplified_segments: tuple[Segment, ...]
+
+
+def segments_equal(left: list[Segment], right: list[Segment]) -> bool:
+    """逐条比较两条合并后的恒照度时间线是否逐时刻相同。
+
+    片段起止完全一致且照度差在 EPSILON 内即视为相同；片段之外的时间
+    两条时间线都是无灯（照度 0），故恒照度片段列表相同等价于在全部
+    区间覆盖的时间范围内"每一时刻的有效照度都相同"（而非仅曝光积分相同）。
+    """
+    if len(left) != len(right):
+        return False
+    return all(
+        a.start == b.start and a.end == b.end and abs(a.lux - b.lux) <= EPSILON
+        for a, b in zip(left, right)
+    )
+
+
+def simplify_intervals(
+    intervals: list[tuple[int, datetime, datetime, float]],
+) -> SimplificationResult:
+    """贪心精简照明区间：按区间 ID 从大到小依次尝试撤去（只读演算）。
+
+    仅当撤去该区间后重新合并（重叠取最大照度）得到的恒照度时间线与**原计划**
+    逐片段相同时，才把它列为可撤去，并以撤去后的集合继续判断下一条；否则保留。
+    等照度并列、零照度区间与跨日/跨年区间均由合并算法自然处理——比较的是
+    逐时刻有效照度而非曝光积分。无区间时各列表均为空。
+
+    返回 ``(可撤去 ID 升序, 须保留 ID 升序, 原计划片段, 精简计划片段)``。
+    """
+    parsed = [
+        (interval_id, parse_utc(start), parse_utc(end), float(lux))
+        for interval_id, start, end, lux in intervals
+    ]
+    baseline = merge_intervals([(s, e, x) for _, s, e, x in parsed])
+
+    current = list(parsed)
+    removable: list[int] = []
+    for interval_id in sorted((i for i, *_ in parsed), reverse=True):
+        candidate = [item for item in current if item[0] != interval_id]
+        candidate_segments = merge_intervals(
+            [(s, e, x) for _, s, e, x in candidate]
+        )
+        # 不变量：current 的合并结果始终与原计划相同，故与 baseline 比较即可
+        if segments_equal(candidate_segments, baseline):
+            current = candidate
+            removable.append(interval_id)
+
+    simplified = merge_intervals([(s, e, x) for _, s, e, x in current])
+    return SimplificationResult(
+        removable_ids=tuple(sorted(removable)),
+        retained_ids=tuple(i for i, *_ in sorted(current, key=lambda item: item[0])),
+        original_segments=tuple(baseline),
+        simplified_segments=tuple(simplified),
+    )
+
+
 def integrate(segments: list[Segment]) -> float:
     """累计 lux·hour。"""
     return sum(seg.lux * hours_between(seg.start, seg.end) for seg in segments)

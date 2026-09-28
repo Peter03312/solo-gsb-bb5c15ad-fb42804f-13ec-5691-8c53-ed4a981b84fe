@@ -16,6 +16,8 @@ from .schemas import (
     IntervalAttributionItemOut,
     IntervalAttributionOut,
     LightingPreviewExhibitOut,
+    LightingSimplificationOut,
+    MergedSegmentOut,
     OpenHoursCoverageDayOut,
     OpenHoursCoverageIn,
     OpenHoursCoverageOut,
@@ -37,6 +39,7 @@ from .timeline import (
     merge_intervals,
     parse_utc,
     reconcile_illuminance,
+    simplify_intervals,
     year_bounds,
 )
 
@@ -107,6 +110,28 @@ def load_intervals_in_range(
         ORDER BY start_ts
         """,
         (showcase_id, fmt_utc(start), fmt_utc(end)),
+    ).fetchall()
+    return [
+        (r["id"], parse_utc(r["start_ts"]), parse_utc(r["end_ts"]), float(r["lux"]))
+        for r in rows
+    ]
+
+
+def load_all_case_intervals(
+    conn: sqlite3.Connection, showcase_id: int
+) -> list[tuple[int, datetime, datetime, float]]:
+    """取出展柜的全部照明区间（不限年度），返回 (id, start, end, lux)。
+
+    精简建议针对展柜的完整照明计划，跨日 / 跨年区间一并取出，由合并
+    算法在整条时间线上处理。
+    """
+    rows = conn.execute(
+        """
+        SELECT id, start_ts, end_ts, lux FROM light_intervals
+        WHERE showcase_id = ?
+        ORDER BY start_ts
+        """,
+        (showcase_id,),
     ).fetchall()
     return [
         (r["id"], parse_utc(r["start_ts"]), parse_utc(r["end_ts"]), float(r["lux"]))
@@ -419,4 +444,31 @@ def build_illuminance_reconciliation(
             )
             for a in result.anomalies
         ],
+    )
+
+
+def build_lighting_simplification(
+    showcase: sqlite3.Row,
+    intervals: list[tuple[int, datetime, datetime, float]],
+) -> LightingSimplificationOut:
+    """给出展柜全部照明区间的精简建议（只读，不落库）。
+
+    按区间 ID 从大到小依次尝试撤去，仅当撤去后重新合并（重叠取最大照度）
+    的恒照度时间线与原计划逐时刻相同时才列为可撤去，并以更新后的集合判断
+    下一条；比较的是逐时刻有效照度而非曝光积分，等照度并列、零照度与
+    跨日 / 跨年区间均正确处理。无区间时各列表为空。
+    """
+    result = simplify_intervals(intervals)
+
+    def _segment_out(seg: Segment) -> MergedSegmentOut:
+        return MergedSegmentOut(start=seg.start, end=seg.end, lux=_r(seg.lux))
+
+    return LightingSimplificationOut(
+        showcase_id=showcase["id"],
+        showcase_name=showcase["name"],
+        interval_count=len(intervals),
+        removable_interval_ids=list(result.removable_ids),
+        retained_interval_ids=list(result.retained_ids),
+        original_segments=[_segment_out(s) for s in result.original_segments],
+        simplified_segments=[_segment_out(s) for s in result.simplified_segments],
     )

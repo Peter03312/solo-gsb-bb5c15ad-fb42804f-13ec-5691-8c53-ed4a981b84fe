@@ -449,6 +449,30 @@ class IlluminanceReconciliationOut(BaseModel):
     )
 
 
+class LightingSimplificationOut(BaseModel):
+    """展柜照明区间精简建议（只读，不落库）。"""
+
+    showcase_id: int
+    showcase_name: str
+    interval_count: int = Field(description="参与精简的既有照明区间总数")
+    removable_interval_ids: list[int] = Field(
+        default_factory=list,
+        description="可撤去区间 ID（按 ID 从大到小贪心判定，返回时升序）；撤去后逐时刻有效照度不变",
+    )
+    retained_interval_ids: list[int] = Field(
+        default_factory=list,
+        description="须保留区间 ID（升序）；撤去任一条都会改变某时刻的有效照度",
+    )
+    original_segments: list[MergedSegmentOut] = Field(
+        default_factory=list,
+        description="原计划全部区间合并（重叠取最大照度、零照度丢弃）后的恒照度片段"
+    )
+    simplified_segments: list[MergedSegmentOut] = Field(
+        default_factory=list,
+        description="精简计划（仅保留须保留区间）合并后的恒照度片段；与原计划逐时刻相同"
+    )
+
+
 class ExhibitBudgetOut(BaseModel):
     exhibit_id: int
     exhibit_name: str

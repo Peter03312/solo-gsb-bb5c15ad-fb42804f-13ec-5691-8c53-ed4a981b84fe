@@ -10,8 +10,10 @@ from ..budget import (
     build_exhibit_preview,
     build_illuminance_reconciliation,
     build_interval_attribution,
+    build_lighting_simplification,
     build_open_hours_coverage,
     build_safe_lux_limit,
+    load_all_case_intervals,
     load_case_intervals,
     load_intervals_in_range,
     resolve_limit,
@@ -29,6 +31,7 @@ from ..schemas import (
     LightIntervalOut,
     LightingPreviewIn,
     LightingPreviewOut,
+    LightingSimplificationOut,
     OpenHoursCoverageIn,
     OpenHoursCoverageOut,
     SafeLuxLimitIn,
@@ -329,3 +332,17 @@ def illuminance_reconciliation(
     # 请求模型已保证 UTC 下为正向窗口、读数严格递增且首条位于起点
     intervals = load_intervals_in_range(conn, showcase_id, body.start, body.end)
     return build_illuminance_reconciliation(showcase, intervals, body)
+
+
+# ------------------------------------------------------------- 照明区间精简
+
+@router.post(
+    "/showcases/{showcase_id}/lighting-simplification",
+    response_model=LightingSimplificationOut,
+    summary="照明区间精简：贪心撤去冗余区间并给出原计划/精简计划恒照度片段（只读，不落库）",
+)
+def lighting_simplification(showcase_id: int, conn=Depends(get_db)):
+    showcase = _get_showcase(conn, showcase_id)
+    # 全部区间（含跨日/跨年）参与精简；撤去仅在内存演算，不写库
+    intervals = load_all_case_intervals(conn, showcase_id)
+    return build_lighting_simplification(showcase, intervals)
