@@ -262,6 +262,110 @@ def day_bounds(day: datetime) -> tuple[datetime, datetime]:
 
 
 @dataclass(frozen=True)
+class Simplification:
+    """照明计划精简结果：可撤去 / 须保留的区间 ID 与两侧恒照度片段。"""
+
+    removable_ids: tuple[int, ...]
+    retained_ids: tuple[int, ...]
+    original_segments: tuple[Segment, ...]
+    simplified_segments: tuple[Segment, ...]
+
+
+def _segment_lux_at(segments: list[Segment], at: datetime) -> float:
+    """取合并时间线在时刻 ``at`` 的有效照度；无片段覆盖（含无灯）按 0 计。"""
+    for seg in segments:
+        if seg.start <= at < seg.end:
+            return seg.lux
+    return 0.0
+
+
+def segments_piecewise_equal(
+    segments_a: list[Segment],
+    segments_b: list[Segment],
+    span_start: datetime,
+    span_end: datetime,
+) -> bool:
+    """在 [span_start, span_end) 内逐时刻比较两条时间线的有效照度是否完全相同。
+
+    **不比较曝光积分**：即使两侧 lux·hour 总量相等，照度随时间的形状不同也判
+    不等。做法是取两侧全部片段起止点（外加跨度边界）把时间轴统一切成基本片，
+    每片内部照度恒定，取片中一个内部时刻比较两侧照度；任一片不同即返回 False。
+    基本片的边界同时属于右侧闭开片，故逐中值比较已覆盖跨度内每一时刻。
+    """
+    span_start, span_end = parse_utc(span_start), parse_utc(span_end)
+    points: set[datetime] = {span_start, span_end}
+    for seg in segments_a:
+        points.add(seg.start)
+        points.add(seg.end)
+    for seg in segments_b:
+        points.add(seg.start)
+        points.add(seg.end)
+    ordered = sorted(points)
+    for left, right in zip(ordered, ordered[1:]):
+        if right <= left or right <= span_start or left >= span_end:
+            continue
+        sample = left + (right - left) / 2
+        lux_a = _segment_lux_at(segments_a, sample)
+        lux_b = _segment_lux_at(segments_b, sample)
+        if abs(lux_a - lux_b) > EPSILON:
+            return False
+    return True
+
+
+def simplify_intervals(
+    intervals: list[tuple[int, datetime, datetime, float]],
+) -> Simplification:
+    """贪心精简照明计划：按区间 ID 从大到小依次尝试撤去（只读演算）。
+
+    仅当撤去某区间后，在**全部区间覆盖的时间范围**（最早起点到最晚终点的跨度；
+    跨度内未排灯时刻两侧皆为 0，故与逐区间并集判定等价）内，每一时刻的有效照度
+    （重叠区间取最大照度）都与原计划完全相同时，才把它列为可撤去，并以更新后的
+    集合继续判断下一条。判定逐时刻比较时间线形状，**不只比较曝光积分**；等照度
+    并列、零照度区间与跨日 / 跨年区间均天然按同一套合并规则处理。
+
+    返回可撤去 / 须保留的区间 ID（均升序）及原计划与精简计划的恒照度片段；
+    无区间时各列表均为空。
+    """
+    parsed = sorted(
+        ((interval_id, parse_utc(start), parse_utc(end), float(lux))
+         for interval_id, start, end, lux in intervals),
+        key=lambda item: item[0],
+    )
+    if not parsed:
+        return Simplification((), (), (), ())
+
+    span_start = min(start for _, start, _, _ in parsed)
+    span_end = max(end for _, _, end, _ in parsed)
+    original_segments = merge_intervals(
+        [(start, end, lux) for _, start, end, lux in parsed]
+    )
+
+    # 工作集合：每试一条都从"撤去已确认冗余区间后"的最新集合出发
+    working: dict[int, tuple[datetime, datetime, float]] = {
+        interval_id: (start, end, lux) for interval_id, start, end, lux in parsed
+    }
+    removable: list[int] = []
+    for interval_id, _start, _end, _lux in sorted(parsed, key=lambda item: -item[0]):
+        trial = [item for key, item in working.items() if key != interval_id]
+        trial_segments = merge_intervals(trial)
+        if segments_piecewise_equal(
+            original_segments, trial_segments, span_start, span_end
+        ):
+            removable.append(interval_id)
+            del working[interval_id]
+
+    simplified_segments = merge_intervals(list(working.values()))
+    removable_set = set(removable)
+    retained = [interval_id for interval_id, *_ in parsed if interval_id not in removable_set]
+    return Simplification(
+        removable_ids=tuple(sorted(removable)),
+        retained_ids=tuple(retained),
+        original_segments=tuple(original_segments),
+        simplified_segments=tuple(simplified_segments),
+    )
+
+
+@dataclass(frozen=True)
 class DeviationAnomaly:
     """超出允许偏差的连续异常时段（同方向相邻片段已合并）。"""
 

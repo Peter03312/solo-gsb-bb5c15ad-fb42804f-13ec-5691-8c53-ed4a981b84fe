@@ -16,6 +16,7 @@ from .schemas import (
     IntervalAttributionItemOut,
     IntervalAttributionOut,
     LightingPreviewExhibitOut,
+    LightingSimplifyOut,
     OpenHoursCoverageDayOut,
     OpenHoursCoverageIn,
     OpenHoursCoverageOut,
@@ -37,6 +38,7 @@ from .timeline import (
     merge_intervals,
     parse_utc,
     reconcile_illuminance,
+    simplify_intervals,
     year_bounds,
 )
 
@@ -90,6 +92,28 @@ def load_case_segments(
         for _, start, end, lux in load_case_intervals(conn, showcase_id, year)
     ]
     return merge_intervals(intervals)
+
+
+def load_all_case_intervals(
+    conn: sqlite3.Connection, showcase_id: int
+) -> list[tuple[int, datetime, datetime, float]]:
+    """取出展柜的全部照明区间（不按年裁剪），返回 (id, start, end, lux)。
+
+    精简判定覆盖所有跨日 / 跨年区间，时间范围由区间自身的最早起点与最晚终点
+    决定，因此不做年度裁剪。
+    """
+    rows = conn.execute(
+        """
+        SELECT id, start_ts, end_ts, lux FROM light_intervals
+        WHERE showcase_id = ?
+        ORDER BY start_ts
+        """,
+        (showcase_id,),
+    ).fetchall()
+    return [
+        (r["id"], parse_utc(r["start_ts"]), parse_utc(r["end_ts"]), float(r["lux"]))
+        for r in rows
+    ]
 
 
 def load_intervals_in_range(
@@ -206,6 +230,35 @@ def build_exhibit_preview(
         delta_lux_hours=_r(preview_total - current_total),
         current_first_exceed_at=current_exceed_at,
         preview_first_exceed_at=preview_exceed_at,
+    )
+
+
+def build_lighting_simplify(
+    showcase: sqlite3.Row,
+    intervals: list[tuple[int, datetime, datetime, float]],
+) -> LightingSimplifyOut:
+    """对展柜全部照明区间给出精简建议（只读，不落库）。
+
+    按区间 ID 从大到小依次贪心尝试撤去：仅当撤去后在全部区间覆盖的时间范围
+    内每一时刻的有效照度（重叠取最大照度）都与原计划完全相同才列为可撤去，
+    并以更新后的集合继续判断下一条。返回可撤去 / 须保留的区间 ID（均升序）
+    及原计划与精简计划的恒照度片段；无区间时各列表为空。
+    """
+    result = simplify_intervals(intervals)
+    return LightingSimplifyOut(
+        showcase_id=showcase["id"],
+        showcase_name=showcase["name"],
+        interval_count=len(intervals),
+        removable_interval_ids=list(result.removable_ids),
+        retained_interval_ids=list(result.retained_ids),
+        original_segments=[
+            {"start": seg.start, "end": seg.end, "lux": _r(seg.lux)}
+            for seg in result.original_segments
+        ],
+        simplified_segments=[
+            {"start": seg.start, "end": seg.end, "lux": _r(seg.lux)}
+            for seg in result.simplified_segments
+        ],
     )
 
 

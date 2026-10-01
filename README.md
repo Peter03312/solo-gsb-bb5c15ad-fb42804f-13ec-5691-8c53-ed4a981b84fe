@@ -302,11 +302,41 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/illuminance-reconciliation \
 }
 ```
 
+照明计划精简建议（不落库）：策展人对展柜的**全部**照明区间取得精简建议。服务按区间 ID
+**从大到小**依次尝试撤去——仅当撤去后，在**全部区间覆盖的时间范围**内，**每一时刻**的有效
+照度（重叠取最大照度）都与原计划完全相同时，才把它列为可撤去，并以**更新后的集合**继续判断
+下一条；最终返回可撤去与须保留的区间 ID（均升序）以及原计划与精简计划的恒照度片段：
+
+```bash
+curl -s -X POST localhost:8000/api/v1/showcases/1/lighting-simplify
+```
+
+响应示例（5 条区间：背景 50 lux、被压制的 30 lux、同照度副本、次日 0 lux 与次日 80 lux。
+30 lux 全程被 50 lux 压制、50 lux 副本等照度并列留最小 ID、0 lux 不改变任何时刻照度，
+三者可撤；原计划与精简计划逐时刻恒照度片段完全相同）：
+
+```json
+{
+  "showcase_id": 1,
+  "showcase_name": "敦煌展厅A柜",
+  "interval_count": 5,
+  "removable_interval_ids": [2, 3, 4],
+  "retained_interval_ids": [1, 5],
+  "original_segments": [
+    {"start": "2026-09-18T08:00:00Z", "end": "2026-09-18T16:00:00Z", "lux": 50.0},
+    {"start": "2026-09-19T08:00:00Z", "end": "2026-09-19T12:00:00Z", "lux": 80.0}
+  ],
+  "simplified_segments": [
+    {"start": "2026-09-18T08:00:00Z", "end": "2026-09-18T16:00:00Z", "lux": 50.0},
+    {"start": "2026-09-19T08:00:00Z", "end": "2026-09-19T12:00:00Z", "lux": 80.0}
+  ]
+}
+```
+
 ## 计算规则
 
 - **时间线合并**：把展柜所有区间的开/关灯时刻作为事件扫描；任意时刻有多盏灯亮，有效照度取
-  **最大值**（`max`，不累加）；相邻同照度片段自动合并。
-- **曝光量**：`曝光(lux·hour) = 有效照度(lux) × 时长(hour)`，按公历年（UTC 1/1 起）累计；
+  **最大值**（`max`，不累加）；相邻同照度片段自动合并。- **曝光量**：`曝光(lux·hour) = 有效照度(lux) × 时长(hour)`，按公历年（UTC 1/1 起）累计；
   跨年区间自动裁剪到当年。
 - **首次超预算时刻**：片段内照度恒定、曝光线性增长，越界时刻按
   `片段起点 + (上限 − 已累计) / lux` 精确插值；**恰好等于上限不算超标**。
@@ -350,6 +380,16 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/illuminance-reconciliation \
   偏差的片段累计为 `over_tolerance_hours`（**恰等于阈值不算异常**），并把同方向、时间
   相邻的异常片段合并为连续异常时段 `anomalies`（`over`=实测高于计划、`under`=实测低于
   计划，中间隔着合规片段则断开为两段）。全程只读，不改动已存区间。
+- **照明计划精简建议**：`POST .../lighting-simplify` 无需请求体，只读取出展柜的**全部**
+  照明区间（不按年裁剪，跨日 / 跨年区间一并参与），按区间 ID **从大到小**依次贪心尝试
+  撤去：仅当撤去后在全部区间覆盖的时间范围（最早起点至最晚终点）内**每一时刻**的有效
+  照度（重叠取最大照度）都与原计划完全相同时才列为可撤去，并以**更新后的集合**继续判断
+  下一条。判定把原计划与试算时间线在所有片段边界统一切片、逐片中值比较照度——**逐时刻
+  比较，不只比较曝光积分**（积分相等而照度形状不同的区间仍须保留）。等照度并列区间因
+  ID 降序尝试而保留最小 ID；0 lux 区间不改变任何时刻照度，恒为可撤去；跨日 / 跨年区间
+  按同一套合并规则处理。返回 `removable_interval_ids` / `retained_interval_ids`（均
+  升序）与原计划、精简计划合并后的恒照度片段（二者逐时刻相同）；展柜无区间时各列表与
+  片段均为空。全程只读，不改动已存区间。
 - **时间**：接受带时区 ISO 8601；naive 时间视为 UTC；内部统一 UTC 存储与返回。
 
 ### 敏感度默认年度上限
@@ -375,6 +415,8 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/illuminance-reconciliation \
   为负；允许偏差为负或非有限值 → `422`。
 - **未知展品 / 未知展柜**：查询或向不存在的展柜提交数据 → `404`。
 - **试算撤去项**：`remove_interval_ids` 含不存在或不属于该展柜的区间 ID → `404`。
+- **照明计划精简**：该接口无请求体、无额外参数；向不存在的展柜查询 → `404`，展柜无
+  区间时返回 200 与空列表（非错误）。
 - 非有限数值（NaN / Infinity）→ `422`；重名冲突 → `409`。
 
 ## API 一览
@@ -396,6 +438,7 @@ curl -s -X POST localhost:8000/api/v1/showcases/1/illuminance-reconciliation \
 | POST | `/api/v1/showcases/{id}/open-hours-coverage` | **开放时段照明覆盖巡检**（逐日缺口/达标小时数/达标比例，不落库） |
 | POST | `/api/v1/showcases/{id}/interval-attribution` | **窗口曝光归因**（最亮者平分曝光、较暗者记遮蔽小时数，不落库） |
 | POST | `/api/v1/showcases/{id}/illuminance-reconciliation` | **现场照度对账**（实测 vs 计划逐段积分正负偏差、超差时长与连续异常时段，不落库） |
+| POST | `/api/v1/showcases/{id}/lighting-simplify` | **照明计划精简建议**（按区间 ID 从大到小贪心撤去冗余区间，返回可撤去/须保留 ID 与原计划/精简计划恒照度片段，不落库） |
 | GET | `/api/v1/showcases/{id}/intervals?day=YYYY-MM-DD` | 区间查询，**可按日期过滤** |
 | GET | `/api/v1/showcases/{id}/budget?day=YYYY-MM-DD` | **按展柜 + 日期查预算** |
 | GET | `/api/v1/exhibits/{id}/budget?day=YYYY-MM-DD` | 按单件展品查预算 |
@@ -416,7 +459,7 @@ app/
 └── routers/
     ├── showcases.py   # 展柜 / 展品 / 照明区间
     └── reports.py     # 预算查询
-tests/                 # pytest：算法单测 + API 集成测试（68 项）
+tests/                 # pytest：算法单测 + API 集成测试（85 项）
 Dockerfile             # python:3.12-slim + HEALTHCHECK
 docker-compose.yml     # 单命令启动 + 数据卷
 ```
@@ -434,4 +477,6 @@ pytest -q
 门槛校验、只读性）、窗口曝光归因（重叠取 max 与遮蔽计时、并列最亮平分、跨界裁剪、0 lux
 区间、31 天窗口校验、只读性）、现场照度对账（正负偏差逐段积分、未排灯按 0、同方向连续
 异常合并与合规段断开、计划/实测变化点统一切片、跨界裁剪、恰等于阈值不记异常、窗口与读数
-校验、时区归一化、只读性）、重启持久化等。
+校验、时区归一化、只读性）、照明计划精简（等照度并列留最小 ID、更亮灯压制暗灯、同照度
+包含可撤、积分相同形状不同不可撤、首尾相接扩展覆盖须保留、0 lux 恒可撤、跨日跨年、空
+展柜空列表、逐时刻而非积分比较、ID 升序输出、只读性）、重启持久化等。

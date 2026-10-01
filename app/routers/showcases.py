@@ -10,8 +10,10 @@ from ..budget import (
     build_exhibit_preview,
     build_illuminance_reconciliation,
     build_interval_attribution,
+    build_lighting_simplify,
     build_open_hours_coverage,
     build_safe_lux_limit,
+    load_all_case_intervals,
     load_case_intervals,
     load_intervals_in_range,
     resolve_limit,
@@ -29,6 +31,7 @@ from ..schemas import (
     LightIntervalOut,
     LightingPreviewIn,
     LightingPreviewOut,
+    LightingSimplifyOut,
     OpenHoursCoverageIn,
     OpenHoursCoverageOut,
     SafeLuxLimitIn,
@@ -265,8 +268,21 @@ def lighting_preview(showcase_id: int, body: LightingPreviewIn, conn=Depends(get
     }
 
 
-# ------------------------------------------------------------- 安全照度上限
+# ------------------------------------------------------------- 照明计划精简
 
+@router.post(
+    "/showcases/{showcase_id}/lighting-simplify",
+    response_model=LightingSimplifyOut,
+    summary="照明计划精简建议：按区间 ID 从大到小贪心撤去冗余区间（只读，不落库）",
+)
+def lighting_simplify(showcase_id: int, conn=Depends(get_db)):
+    showcase = _get_showcase(conn, showcase_id)
+    # 展柜全部区间（含跨日 / 跨年，不做年度裁剪）；判定全程只读，不写库
+    intervals = load_all_case_intervals(conn, showcase_id)
+    return build_lighting_simplify(showcase, intervals)
+
+
+# ------------------------------------------------------------- 安全照度上限
 @router.post(
     "/showcases/{showcase_id}/safe-lux-limit",
     response_model=SafeLuxLimitOut,
